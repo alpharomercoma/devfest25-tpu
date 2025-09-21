@@ -1,0 +1,3 @@
+torch
+torchvision
+torch_xla[tpu]
