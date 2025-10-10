@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
-from torch.amp import autocast, GradScaler
 
 
 class Net(nn.Module):
@@ -36,27 +35,15 @@ class Net(nn.Module):
         return output
 
 
-def train(args, model, device, train_loader, optimizer, epoch, scaler=None):
+def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        # Use mixed precision if enabled
-        if scaler is not None:
-            with autocast('cuda'):
-                output = model(data)
-                loss = F.nll_loss(output, target)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            output = model(data)
-            loss = F.nll_loss(output, target)
-            loss.backward()
-            optimizer.step()
-
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.nll_loss(output, target)
+        loss.backward()
+        optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
@@ -65,24 +52,16 @@ def train(args, model, device, train_loader, optimizer, epoch, scaler=None):
                 break
 
 
-def test(model, device, test_loader, scaler=None):
+def test(model, device, test_loader):
     model.eval()
     test_loss = 0
     correct = 0
     with torch.no_grad():
         for data, target in test_loader:
-            data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
-
-            # Use mixed precision for inference if enabled
-            if scaler is not None:
-                with autocast('cuda'):
-                    output = model(data)
-                    test_loss += F.nll_loss(output, target, reduction='sum').item()
-            else:
-                output = model(data)
-                test_loss += F.nll_loss(output, target, reduction='sum').item()
-
-            pred = output.argmax(dim=1, keepdim=True)
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
+            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
@@ -94,9 +73,9 @@ def test(model, device, test_loader, scaler=None):
 
 def main():
     # Training settings
-    parser = argparse.ArgumentParser(description='PyTorch MNIST Example (Optimized)')
-    parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                        help='input batch size for training (default: 128)')
+    parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
+    parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+                        help='input batch size for training (default: 64)')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='input batch size for testing (default: 1000)')
     parser.add_argument('--epochs', type=int, default=14, metavar='N',
@@ -107,88 +86,78 @@ def main():
                         help='Learning rate step gamma (default: 0.7)')
     parser.add_argument('--no-accel', action='store_true',
                         help='disables accelerator')
-    parser.add_argument('--no-amp', action='store_true',
-                        help='disables automatic mixed precision')
     parser.add_argument('--dry-run', action='store_true',
                         help='quickly check a single pass')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
-    parser.add_argument('--num-workers', type=int, default=4, metavar='N',
-                        help='number of data loading workers (default: 4)')
     parser.add_argument('--save-model', action='store_true',
                         help='For Saving the current Model')
+    # args, _ = parser.parse_args()
     args, _ = parser.parse_known_args()
 
-    use_accel = not args.no_accel and torch.cuda.is_available()
-    use_amp = use_accel and not args.no_amp
+    use_accel = not args.no_accel and torch.accelerator.is_available()
 
     torch.manual_seed(args.seed)
 
     if use_accel:
-        device = torch.device("cuda")
-        # Enable cuDNN benchmark mode for optimized convolution algorithms
-        torch.backends.cudnn.benchmark = True
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        device = torch.accelerator.current_accelerator()
     else:
         device = torch.device("cpu")
-        print("Using CPU")
 
     train_kwargs = {'batch_size': args.batch_size}
     test_kwargs = {'batch_size': args.test_batch_size}
-
     if use_accel:
-        accel_kwargs = {
-            'num_workers': args.num_workers,
-            'persistent_workers': True if args.num_workers > 0 else False,
-            'pin_memory': True,
-            'shuffle': True,
-            'prefetch_factor': 2 if args.num_workers > 0 else None
-        }
+        accel_kwargs = {'num_workers': 1,
+                        'persistent_workers': True,
+                       'pin_memory': True,
+                       'shuffle': True}
         train_kwargs.update(accel_kwargs)
         test_kwargs.update(accel_kwargs)
-        test_kwargs['shuffle'] = False  # Don't shuffle test set
 
-    transform = transforms.Compose([
+    transform=transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
-    ])
-
-    dataset1 = datasets.MNIST('../data', train=True, download=True, transform=transform)
-    dataset2 = datasets.MNIST('../data', train=False, transform=transform)
-    train_loader = torch.utils.data.DataLoader(dataset1, **train_kwargs)
+        ])
+    dataset1 = datasets.MNIST('../data', train=True, download=True,
+                       transform=transform)
+    dataset2 = datasets.MNIST('../data', train=False,
+                       transform=transform)
+    train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
     model = Net().to(device)
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
+
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
 
-    # Initialize gradient scaler for mixed precision training
-    scaler = GradScaler('cuda') if use_amp else None
-    if use_amp:
-        print("Using Automatic Mixed Precision (AMP)")
-
-    # Start timing
-    start_time = time.time()
+    # --- start timing ---
+    start_time = time.time()   # <-- added
+    # ----------------------
 
     for epoch in range(1, args.epochs + 1):
-        train(args, model, device, train_loader, optimizer, epoch, scaler)
-        test(model, device, test_loader, scaler)
+        train(args, model, device, train_loader, optimizer, epoch)
+        test(model, device, test_loader)
         scheduler.step()
 
-    # Synchronize device before measuring end time
-    if use_accel:
-        torch.cuda.synchronize()
+    # synchronize device before measuring end time (important for GPU)
+    try:
+        if device is not None and getattr(device, "type", None) == "cuda":
+            torch.cuda.synchronize()
+    except Exception:
+        # If device doesn't have .type or torch.cuda.synchronize fails, ignore and continue
+        pass
 
-    # End timing and print total
-    total_time = time.time() - start_time
+    # --- end timing and print total ---
+    total_time = time.time() - start_time   # <-- added
+    # format as H:MM:SS and also show seconds with milliseconds
     formatted = str(timedelta(seconds=int(total_time)))
-    print(f"\nTotal training time: {formatted} ({total_time:.3f} seconds)")
+    print(f"Total time: {formatted} ({total_time:.3f} seconds)")
+    # ------------------------------------
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
-        print("Model saved to mnist_cnn.pt")
 
 
 if __name__ == '__main__':
